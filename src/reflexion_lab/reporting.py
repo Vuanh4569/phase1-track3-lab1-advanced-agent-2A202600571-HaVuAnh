@@ -24,7 +24,9 @@ def failure_breakdown(records: list[RunRecord]) -> dict:
 
 def build_report(records: list[RunRecord], dataset_name: str, mode: str = "mock") -> ReportPayload:
     examples = [{"qid": r.qid, "agent_type": r.agent_type, "gold_answer": r.gold_answer, "predicted_answer": r.predicted_answer, "is_correct": r.is_correct, "attempts": r.attempts, "failure_mode": r.failure_mode, "reflection_count": len(r.reflections)} for r in records]
-    return ReportPayload(meta={"dataset": dataset_name, "mode": mode, "num_records": len(records), "agents": sorted({r.agent_type for r in records})}, summary=summarize(records), failure_modes=failure_breakdown(records), examples=examples, extensions=["structured_evaluator", "reflection_memory", "benchmark_report_json", "mock_mode_for_autograding"], discussion="Reflexion helps when the first attempt stops after the first hop or drifts to a wrong second-hop entity. The tradeoff is higher attempts, token cost, and latency. In a real report, students should explain when the reflection memory was useful, which failure modes remained, and whether evaluator quality limited gains.")
+    f_breakdown = failure_breakdown(records)
+    f_breakdown["all_agents_combined"] = dict(Counter(r.failure_mode for r in records))
+    return ReportPayload(meta={"dataset": dataset_name, "mode": mode, "num_records": len(records), "agents": sorted({r.agent_type for r in records})}, summary=summarize(records), failure_modes=f_breakdown, examples=examples, extensions=["structured_evaluator", "reflection_memory", "benchmark_report_json", "mock_mode_for_autograding"], discussion="Reflexion helps when the first attempt stops after the first hop or drifts to a wrong second-hop entity. The tradeoff is higher attempts, token cost, and latency. In a real report, students should explain when the reflection memory was useful, which failure modes remained, and whether evaluator quality limited gains.")
 
 def save_report(report: ReportPayload, out_dir: str | Path) -> tuple[Path, Path]:
     out_dir = Path(out_dir)
@@ -36,6 +38,28 @@ def save_report(report: ReportPayload, out_dir: str | Path) -> tuple[Path, Path]
     react = s.get("react", {})
     reflexion = s.get("reflexion", {})
     delta = s.get("delta_reflexion_minus_react", {})
+    
+    # Calculate costs
+    react_avg_tokens = react.get('avg_token_estimate', 0)
+    reflexion_avg_tokens = reflexion.get('avg_token_estimate', 0)
+    delta_avg_tokens = delta.get('tokens_abs', 0)
+    
+    react_cost_per_run = react_avg_tokens * 0.0000001725
+    reflexion_cost_per_run = reflexion_avg_tokens * 0.0000001725
+    delta_cost_per_run = delta_avg_tokens * 0.0000001725
+    
+    react_count = react.get('count', 0)
+    reflexion_count = reflexion.get('count', 0)
+    total_count = report.meta['num_records']
+    
+    react_total_tokens = int(react_count * react_avg_tokens)
+    reflexion_total_tokens = int(reflexion_count * reflexion_avg_tokens)
+    
+    react_total_cost = react_total_tokens * 0.0000001725
+    reflexion_total_cost = reflexion_total_tokens * 0.0000001725
+    total_cost = react_total_cost + reflexion_total_cost
+    total_cost_vnd = int(round(total_cost * 24838 / 10.0) * 10)
+    
     ext_lines = "\n".join(f"- {item}" for item in report.extensions)
     md = f"""# Lab 16 Benchmark Report
 
@@ -52,6 +76,13 @@ def save_report(report: ReportPayload, out_dir: str | Path) -> tuple[Path, Path]
 | Avg attempts | {react.get('avg_attempts', 0)} | {reflexion.get('avg_attempts', 0)} | {delta.get('attempts_abs', 0)} |
 | Avg token estimate | {react.get('avg_token_estimate', 0)} | {reflexion.get('avg_token_estimate', 0)} | {delta.get('tokens_abs', 0)} |
 | Avg latency (ms) | {react.get('avg_latency_ms', 0)} | {reflexion.get('avg_latency_ms', 0)} | {delta.get('latency_abs', 0)} |
+| Est. cost per run ($) | {react_cost_per_run:.5f} | {reflexion_cost_per_run:.5f} | {delta_cost_per_run:.5f} |
+
+## Cost Estimation (GPT-4o-mini)
+Using GPT-4o-mini API pricing ($0.150 per 1M input tokens, $0.600 per 1M output tokens) and assuming a realistic 95% input / 5% output token split:
+- **ReAct Agent Cost ({react_count} runs)**: Total of {react_total_tokens:,} tokens $\\approx$ **${react_total_cost:.4f}**
+- **Reflexion Agent Cost ({reflexion_count} runs)**: Total of {reflexion_total_tokens:,} tokens $\\approx$ **${reflexion_total_cost:.4f}**
+- **Total Experiment Cost ({total_count} runs)**: **${total_cost:.4f}** (~{total_cost_vnd:,} VNĐ)
 
 ## Failure modes
 ```json
